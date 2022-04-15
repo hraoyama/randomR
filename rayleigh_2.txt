@@ -1,0 +1,269 @@
+
+set.seed(1234)
+
+# install.packages(c("expm","nloptr","PMA","ggplot2","ggthemes","foreach","data.table", "pracma","PMA","plyr","zoo","xts","shiny","lubridate","stringr","microbenchmark","esquisse","genlasso","elasticnet"), quiet=TRUE, verbose=FALSE)
+# install.packages("nloptr")
+# install.packages("pracma")
+library(nloptr)
+library(PMA)
+library(pracma)
+
+
+gen_vec_with_norm_less_than <- function(l, scale, p=2) {
+  vec = rand(1, l)
+  vec = vec*scale / pracma::Norm(vec, p)
+  return(vec)
+}
+
+gen_len1_u_subjB <- function(B, ceiling=1.0, scaling = NULL, max_iter = 50) {
+ 
+  if(is.null(scaling)) { scaling = runif(1,0.001,ceiling/4.0) }  
+  u_of_length_1 = gen_vec_with_norm_less_than(ncol(B), scaling, 2)
+  iter = 0
+  while( (u_of_length_1 %*% B %*% t(u_of_length_1) > ceiling) & (iter < max_iter)   ) {
+    u_of_length_1 = gen_vec_with_norm_less_than(ncol(B), scaling, 2)  
+    iter = iter + 1
+  }
+  return(u_of_length_1)
+}
+
+
+### Introduction
+# Parameters
+p <- 10
+c <- 1.2  # budget on L1
+
+# Random A and B PSD matrices
+Ip <- diag(p)
+A <- rWishart(1,p,Ip)[,,1]/p
+B <- rWishart(1,p,Ip)[,,1]/p
+
+# Deriving C and M
+C <- sqrtm(B)$Binv%*%A%*%sqrtm(B)$Binv
+M <- sqrtm(B)$Binv%*%sqrtm(A)$B
+
+# Verify that MM^T and C are the same
+M%*%t(M) - C
+
+sqrtm(B)$Binv-solve(sqrtm(B)$B)
+
+
+
+### PCA, sparse PCA and Penalised Matrix Decomposition
+pca <- prcomp(C)
+spc <- SPC(C, sumabsv = c, center = FALSE)
+pmd <- PMD(M,"standard", sumabsu = 0.3, sumabsv = NULL, center = FALSE)
+
+pca$rotation[,1]
+spc$v
+pmd$u
+
+all(eigen(C)$values > 0.0)
+
+### Non-Linear Optimisation
+
+## Option 1 -- PMD
+
+# Objective: max   t(w) * A^(1/2) * v
+  #  s.t. Norm(v,1) <= 1.0
+  #  s.t. Norm(v,2) <= 1.0
+  #  s.t. t(w) *  B * w <= 1.0
+  #  s.t. Norm(w,1) <= C (budget)
+
+# Objective function (expressed as minimization)
+eval_f <- function(x)
+{
+  return (-as.numeric(t(x[1:p])%*%sqrtm(A)$Binv%*%x[(p+1):(2*p)]))
+}
+
+# Inequality constraints
+eval_g_ineq <- function (x) {
+  constr <- c(sum(abs(x[(p+1):(2*p)]))-1.0,
+              as.numeric(t(x[(p+1):(2*p)])%*%x[(p+1):(2*p)] -1),
+              as.numeric(t(x[1:p])%*%B%*%x[1:p] -1),
+              sum(abs(x[1:p]))-c
+              )
+  return (constr)
+}
+
+# Lower and upper bounds
+lb <- rep(-1,(2*p))
+ub <- rep(1, (2*p))
+
+# Initial values
+x0 <- rbind(pmd$u,pmd$v)
+
+# Optimisation parameters
+opts <- list( "algorithm"= "NLOPT_GN_ISRES",
+              "xtol_rel"= 1.0e-5,
+              "maxeval"= 200000,
+              "tol_constraints_ineq" = rep(1.0e-5, 4))
+
+# Optimisation
+res_pmd <- nloptr(
+  x0          = x0,
+  eval_f      = eval_f,
+  lb          = lb,
+  ub          = ub,
+  eval_g_ineq = eval_g_ineq,
+  opts        = opts )
+
+# Checking solutions
+t(res_pmd$solution[1:p])%*%B%*%res_pmd$solution[1:p]
+sum(abs(res_pmd$solution[1:p]))
+t(res_pmd$solution[(p+1):(2*p)])%*%res_pmd$solution[(p+1):(2*p)]
+
+
+pmd$u
+
+## Option 2 -- PMD w/Generalised LASSO
+
+  # Objective: max   t(u) * M * v
+  #  s.t. Norm(u,2) <= 1.0
+  #  s.t. Norm(v,2) <= 1.0
+  #  s.t. Norm(B^(-1/2) * u,1) <= C (budget)
+
+
+# Objective function
+eval_f <- function(x)
+{
+  return (-as.numeric(t(x[1:p])%*%M%*%x[(p+1):(2*p)]))
+}
+
+# Inequality constraints
+eval_g_ineq <- function (x) {
+  constr <- c(as.numeric(t(x[1:p])%*%x[1:p] -1),
+              as.numeric(t(x[(p+1):(2*p)])%*%x[(p+1):(2*p)] -1),
+              sum(abs(sqrtm(B)$Binv%*%x[1:p]))-c)
+  return (constr)
+}
+
+# Lower and upper bounds
+lb <- rep(-1,(2*p))
+ub <- rep(1, (2*p))
+
+# Initial values
+x0 <- rbind(pmd$u,pmd$v)
+
+# Optimisation parameters
+opts <- list( "algorithm"
+              = "NLOPT_GN_ISRES",
+              "xtol_rel"
+              = 1.0e-5,
+              "maxeval"= 2000000,
+              "tol_constraints_ineq" = rep(1.0e-5, 3))
+
+# Optimisation
+res_pmd_generalised <- nloptr(
+  x0          = x0,
+  eval_f      = eval_f,
+  lb          = lb,
+  ub          = ub,
+  eval_g_ineq = eval_g_ineq,
+  opts        = opts )
+
+Norm(sqrtm(B)$Binv%*%res_pmd_generalised$solution[1:p],1)
+
+# Checking solutions
+t(res_pmd_generalised$solution[1:p])%*%res_pmd_generalised$solution[1:p]
+sum(abs(sqrtm(B)$Binv%*%res_pmd_generalised$solution[1:p]))
+t(res_pmd_generalised$solution[(p+1):(2*p)])%*%res_pmd_generalised$solution[(p+1):(2*p)]
+
+## Option 3 (Max numerator with constraint on denominator)
+ 
+  # Objective: max  t(x) * A * x
+  #  s.t. Norm(x,1) <= C (budget)
+  #  s.t. t(x) *  B * x <= 1.0
+
+# Objective function
+eval_f <- function(x)
+{
+  return (-as.numeric(t(x)%*%A%*%x))
+}
+
+# Inequality constraints
+eval_g_ineq <- function (x) {
+  constr <- c(as.numeric(t(x)%*%B%*%x-1),
+              sum(abs(x))-c)
+  return (constr)
+}
+
+# Lower and upper bounds
+lb <- rep(-1,p)
+ub <- rep(1,p)
+
+# Initial values
+x0 <- rbind(pmd$u)
+
+# Optimisation parameters
+opts <- list( "algorithm"= "NLOPT_GN_ISRES",
+              "xtol_rel"= 1.0e-5,
+              "maxeval"= 200000,
+              "tol_constraints_ineq" = rep(1.0e-5, 2))
+
+# Optimisation
+res_ratio <- nloptr(
+  x0          = x0,
+  eval_f      = eval_f,
+  lb          = lb,
+  ub          = ub,
+  eval_g_ineq = eval_g_ineq,
+  opts        = opts )
+
+# Checking solutions
+t(res_ratio$solution)%*%B%*%res_ratio$solution
+sum(abs(res_ratio$solution))
+
+
+
+## Option 4 (Actual Rayleigh Ratio)
+
+  # Objective: max ( t(x) * A * x ) / ( t(x) * B * x )
+  #  s.t. Norm(x,2) <= 1
+  #  s.t. Norm(x,1) <= c (budget)
+
+# Objective function
+eval_f <- function(x)
+{
+  return (-as.numeric(t(x)%*%A%*%x)/as.numeric(t(x)%*%B%*%x))
+}
+
+# Inequality constraints
+eval_g_ineq <- function (x) {
+  constr <- c(as.numeric(t(x)%*%x-1),
+              1-as.numeric(t(x)%*%x),
+              sum(abs(x))-c)
+  return (constr)
+}
+
+# Lower and upper bounds
+lb <- rep(-1,p)
+ub <- rep(1,p)
+
+# Initial values
+x0 <- rbind(spc$v)
+
+# Optimisation parameters
+opts <- list( "algorithm"
+              = "NLOPT_GN_ISRES",
+              "xtol_rel"
+              = 1.0e-5,
+              "maxeval"= 200000,
+              "tol_constraints_ineq" = rep(1.0e-5, 3))
+
+# Optimisation
+res_cca <- nloptr(
+  x0          = x0,
+  eval_f      = eval_f,
+  lb          = lb,
+  ub          = ub,
+  eval_g_ineq = eval_g_ineq,
+  opts        = opts )
+
+# Checking solutions
+t(res_cca$solution)%*%res_cca$solution
+sum(abs(res_cca$solution))
+
+plot(res_cca$solution)
+
+
